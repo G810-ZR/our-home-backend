@@ -228,7 +228,7 @@ async function maybeCompress(sessionId, settings) {
 // ═══ 对话接口（核心） ═══
 
 app.post('/api/chat', async (req, res) => {
-  const { message, sessionId } = req.body
+  const { message, sessionId, model: reqModel } = req.body
 
   if (!message || !message.trim()) {
     return res.status(400).json({ error: '消息不能为空' })
@@ -254,6 +254,7 @@ app.post('/api/chat', async (req, res) => {
     let systemPrompt = DEFAULT_SYSTEM_PROMPT
     let memories = []
     let settings = null
+    let model = reqModel || DEEPSEEK_MODEL
     let maxTokens = 1024
     let temperature = 0.7
 
@@ -280,7 +281,7 @@ app.post('/api/chat', async (req, res) => {
         'Authorization': `Bearer ${DEEPSEEK_API_KEY}`
       },
       body: JSON.stringify({
-        model: DEEPSEEK_MODEL,
+        model,
         messages: contextMessages,
         max_tokens: maxTokens,
         temperature
