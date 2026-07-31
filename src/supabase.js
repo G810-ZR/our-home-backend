@@ -73,6 +73,27 @@ export async function hideMessages(ids) {
   if (error) throw error
 }
 
+// ── 记忆操作 ──
+export async function getAllMemories() {
+  const { data, error } = await supabase
+    .from('memories')
+    .select('*')
+    .order('created_at', { ascending: false })
+    .limit(20)
+  if (error) throw error
+  return data
+}
+
+export async function saveMemory(content, sourceIds = []) {
+  const { data, error } = await supabase
+    .from('memories')
+    .insert({ content, source_ids: sourceIds })
+    .select()
+    .single()
+  if (error) throw error
+  return data
+}
+
 // ── 设置操作 ──
 export async function getSettings() {
   const { data, error } = await supabase

@@ -4,8 +4,10 @@ import {
   supabase,
   getSessions, createSession, updateSession, deleteSession,
   getMessages, saveMessage, hideMessages,
+  getAllMemories, saveMemory,
   getSettings
 } from './supabase.js'
+import { estimateTokens, estimateMessageTokens } from './tokenizer.js'
 
 const app = express()
 const PORT = process.env.PORT || 4000
@@ -149,6 +151,80 @@ app.get('/api/sessions/:id/messages', async (req, res) => {
   }
 })
 
+// ═══ 上下文组装与压缩 ═══
+
+async function buildContext(systemPrompt, history, memories) {
+  const layers = [{ role: 'system', content: systemPrompt }]
+
+  // 注入记忆摘要
+  if (memories && memories.length > 0) {
+    const memoryText = '【以下是之前对话的摘要，供你了解背景】\n' +
+      memories.map((m, i) => `${i + 1}. ${m.content}`).join('\n')
+    layers.push({ role: 'system', content: memoryText })
+  }
+
+  // 加入历史消息
+  return [...layers, ...history]
+}
+
+async function maybeCompress(sessionId, settings) {
+  const threshold = settings?.summary_threshold || 4000
+  const keepRounds = settings?.summary_keep_rounds || 3
+
+  // 获取所有可见消息
+  const allMsgs = await getMessages(sessionId, 200)
+  if (allMsgs.length < keepRounds * 2 + 4) return // 太少不压缩
+
+  const totalTokens = estimateMessageTokens(allMsgs)
+  if (totalTokens < threshold) return // 未达阈值
+
+  // 取出最早的几轮作为压缩对象
+  const keepCount = keepRounds * 2 // 保留最近 N 轮（用户+AI = 2条/轮）
+  const toCompress = allMsgs.slice(0, allMsgs.length - keepCount)
+  if (toCompress.length < 4) return
+
+  console.log(`[压缩] session ${sessionId}: ${allMsgs.length} 条消息, ${totalTokens} tokens → 触发压缩`)
+
+  // 组装待压缩内容
+  const compressText = toCompress
+    .map(m => `${m.role === 'user' ? '小狸' : '小克'}: ${m.content}`)
+    .join('\n')
+
+  // 调用模型生成摘要
+  try {
+    const summaryModel = settings?.summary_model || DEEPSEEK_MODEL
+    const response = await fetch('https://api.deepseek.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${DEEPSEEK_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: summaryModel,
+        messages: [
+          { role: 'system', content: '你是对话摘要助手。请将以下对话压缩成一段简洁的摘要（100-200字），保留关键话题、情绪变化和重要结论。只输出摘要本身，不要任何前缀。' },
+          { role: 'user', content: compressText }
+        ],
+        max_tokens: 300,
+        temperature: 0.3
+      })
+    })
+
+    if (response.ok) {
+      const data = await response.json()
+      const summary = data.choices?.[0]?.message?.content
+      if (summary) {
+        const sourceIds = toCompress.map(m => m.id)
+        await saveMemory(summary, sourceIds)
+        await hideMessages(sourceIds)
+        console.log(`[压缩] 完成: ${toCompress.length} 条 → 1 条摘要 (${estimateTokens(summary)} tokens)`)
+      }
+    }
+  } catch (err) {
+    console.error('[压缩] 失败:', err.message)
+  }
+}
+
 // ═══ 对话接口（核心） ═══
 
 app.post('/api/chat', async (req, res) => {
@@ -163,32 +239,40 @@ app.post('/api/chat', async (req, res) => {
   }
 
   try {
-    // 确保会话存在
+    // 1. 确保会话存在
     let sid = sessionId
     if (!sid) {
       const session = await createSession(message.slice(0, 20))
       sid = session.id
     }
 
-    // 保存用户消息
+    // 2. 保存用户消息
     await saveMessage(sid, 'user', message)
 
-    // 获取历史消息作为上下文
+    // 3. 加载上下文
     let history = []
     let systemPrompt = DEFAULT_SYSTEM_PROMPT
-    try {
-      const msgs = await getMessages(sid, 20)
-      history = msgs.slice(0, -1).map(m => ({ role: m.role, content: m.content }))
-      // 尝试从数据库加载设置
-      const settings = await getSettings()
-      if (settings?.system_prompt) {
-        systemPrompt = settings.system_prompt
-      }
-    } catch (_) {
-      // 数据库不可用时降级为无上下文模式
-    }
+    let memories = []
+    let settings = null
+    let maxTokens = 1024
+    let temperature = 0.7
 
-    // 调用 DeepSeek
+    try {
+      settings = await getSettings()
+      if (settings?.system_prompt) systemPrompt = settings.system_prompt
+      if (settings?.max_tokens) maxTokens = settings.max_tokens
+      if (settings?.temperature != null) temperature = settings.temperature
+
+      const msgs = await getMessages(sid, settings?.context_rounds || 20)
+      history = msgs.slice(0, -1).map(m => ({ role: m.role, content: m.content }))
+      memories = await getAllMemories()
+    } catch (_) {}
+
+    // 4. 组装完整上下文：系统提示词 + 记忆摘要 + 历史消息 + 新消息
+    const contextMessages = await buildContext(systemPrompt, history, memories)
+    contextMessages.push({ role: 'user', content: message })
+
+    // 5. 调用 DeepSeek
     const response = await fetch('https://api.deepseek.com/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -197,13 +281,9 @@ app.post('/api/chat', async (req, res) => {
       },
       body: JSON.stringify({
         model: DEEPSEEK_MODEL,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          ...history,
-          { role: 'user', content: message }
-        ],
-        max_tokens: 1024,
-        temperature: 0.7
+        messages: contextMessages,
+        max_tokens: maxTokens,
+        temperature
       })
     })
 
@@ -216,11 +296,14 @@ app.post('/api/chat', async (req, res) => {
     const data = await response.json()
     const reply = data.choices?.[0]?.message?.content || '（我沉默了……）'
 
-    // 保存 AI 回复
+    // 6. 保存 AI 回复
     await saveMessage(sid, 'assistant', reply)
 
-    // 更新会话时间
+    // 7. 更新会话时间
     try { await updateSession(sid, {}) } catch (_) {}
+
+    // 8. 异步触发记忆压缩（不阻塞回复）
+    maybeCompress(sid, settings).catch(err => console.error('[压缩] 后台错误:', err.message))
 
     res.json({ reply, sessionId: sid })
   } catch (err) {
