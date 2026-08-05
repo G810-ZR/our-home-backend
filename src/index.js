@@ -333,6 +333,41 @@ app.post('/api/memories', async (req, res) => {
   }
 })
 
+// ═══ 记忆同步接口 ═══
+
+// 导出小狸最近说的话（只导出用户消息，不含 AI 回复）
+app.get('/api/export-user-messages', async (req, res) => {
+  try {
+    const { since } = req.query
+    let query = supabase
+      .from('messages')
+      .select('content, created_at, session_id')
+      .eq('role', 'user')
+      .eq('visible', true)
+      .not('content', 'is', null)
+      .order('created_at', { ascending: true })
+
+    if (since) {
+      query = query.gte('created_at', since)
+    }
+
+    const { data, error } = await query
+    if (error) throw error
+
+    res.json({
+      count: data?.length || 0,
+      since: since || 'all',
+      messages: (data || []).map(m => ({
+        content: m.content,
+        time: m.created_at
+      }))
+    })
+  } catch (err) {
+    console.error('导出消息失败:', err.message)
+    res.status(500).json({ error: '导出消息失败' })
+  }
+})
+
 // ═══ 设置接口 ═══
 
 app.get('/api/settings', async (_req, res) => {
