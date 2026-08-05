@@ -316,6 +316,23 @@ app.post('/api/chat', async (req, res) => {
   }
 })
 
+// ═══ 记忆接口 ═══
+
+// 手动写入记忆（用于同步本地记忆到数据库）
+app.post('/api/memories', async (req, res) => {
+  try {
+    const { content } = req.body
+    if (!content || !content.trim()) {
+      return res.status(400).json({ error: '记忆内容不能为空' })
+    }
+    const memory = await saveMemory(content.trim(), [])
+    res.json({ success: true, id: memory.id })
+  } catch (err) {
+    console.error('保存记忆失败:', err.message)
+    res.status(500).json({ error: '保存记忆失败' })
+  }
+})
+
 // ═══ 设置接口 ═══
 
 app.get('/api/settings', async (_req, res) => {
